@@ -1,0 +1,816 @@
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════════════
+// AI Smart Market Engine PRO
+// ═══════════════════════════════════════════════════════════════════════════════
+// Version  : 0.3 — Market Structure Engine
+// Market   : NIFTY 50 / BANKNIFTY Index (15 Minute)
+// Purpose  : Non-repainting BUY CE / BUY PE signal engine for index options
+// Design   : Modular architecture — engines added incrementally per release
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// NON-REPAINTING GUARANTEE
+// ─────────────────────────
+// • All signals evaluated on bar close via barstate.isconfirmed
+// • No request.security() with lookahead
+// • No future-referencing offsets (negative bar indices for signals)
+// • Swing / structure pivots confirmed only after right-bar confirmation
+// • VWAP, EMA, ADX computed from historical data only
+//
+// RELEASE ROADMAP
+// ───────────────
+// v0.1  Core Framework
+// v0.2  Trend + VWAP Engines
+// v0.3  Market Structure Engine  ← current
+// v0.4  Liquidity Engine
+// v0.5  AI Confidence Engine
+// v1.0  Complete production strategy
+// ═══════════════════════════════════════════════════════════════════════════════
+
+strategy(
+     title                  = "AI Smart Market Engine PRO",
+     shorttitle             = "AI SME PRO",
+     overlay                = true,
+     initial_capital        = 100000,
+     default_qty_type       = strategy.fixed,
+     default_qty_value      = 1,
+     commission_type        = strategy.commission.percent,
+     commission_value       = 0.03,
+     pyramiding             = 0,
+     calc_on_every_tick     = false,
+     process_orders_on_close = true,
+     max_bars_back          = 5000)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// INPUTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── General ───────────────────────────────────────────────────────────────────
+string GRP_GENERAL = "General Settings"
+int    i_analysisBars    = input.int(500, "Analysis Window (Bars)", minval = 50, maxval = 2000, group = GRP_GENERAL,
+     tooltip = "Number of historical bars used for context and scoring.")
+bool   i_showDashboard   = input.bool(true, "Show Dashboard", group = GRP_GENERAL)
+string i_dashboardPos    = input.string("Top Right", "Dashboard Position",
+     options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group = GRP_GENERAL)
+
+// ── Risk Management (used from v1.0) ──────────────────────────────────────────
+string GRP_RISK = "Risk Management"
+float  i_atrSlMult   = input.float(1.5, "Stop Loss ATR Multiplier", minval = 0.5, step = 0.1, group = GRP_RISK)
+float  i_atrTp1Mult  = input.float(2.0, "Target 1 ATR Multiplier",  minval = 0.5, step = 0.1, group = GRP_RISK)
+float  i_atrTp2Mult  = input.float(3.5, "Target 2 ATR Multiplier",  minval = 0.5, step = 0.1, group = GRP_RISK)
+
+// ── AI Confidence (used from v0.5) ──────────────────────────────────────────────
+string GRP_AI = "AI Confidence"
+float  i_confidenceThreshold = input.float(65.0, "Minimum Confidence Score", minval = 0, maxval = 100, step = 1, group = GRP_AI)
+
+// ── Trend Engine ────────────────────────────────────────────────────────────────
+string GRP_TREND = "Trend Engine"
+int    i_emaFast     = input.int(21,  "Fast EMA Length",       minval = 1, group = GRP_TREND)
+int    i_emaSlow     = input.int(55,  "Slow EMA Length",       minval = 1, group = GRP_TREND)
+int    i_adxLength   = input.int(14,  "ADX Length",            minval = 1, group = GRP_TREND)
+float  i_adxStrong   = input.float(25, "Strong Trend ADX",      minval = 5, step = 0.5, group = GRP_TREND)
+float  i_adxRangeMax = input.float(18, "Range Regime Max ADX",  minval = 5, step = 0.5, group = GRP_TREND)
+int    i_slopeLen    = input.int(5,   "EMA Slope Lookback",     minval = 1, maxval = 50, group = GRP_TREND)
+float  i_emaSpreadRange = input.float(0.12, "Range EMA Spread Max (%)", minval = 0.01, step = 0.01, group = GRP_TREND,
+     tooltip = "Max EMA spread (% of price) to classify as Range when ADX is weak.")
+bool   i_showEmas    = input.bool(true,  "Plot EMAs",            group = GRP_TREND)
+bool   i_showVwap    = input.bool(true,  "Plot VWAP",            group = GRP_TREND)
+
+// ── Volume Engine (used from v0.5) ──────────────────────────────────────────────
+string GRP_VOLUME = "Volume Engine"
+int    i_rvolLength  = input.int(20,  "Relative Volume Lookback", minval = 5, group = GRP_VOLUME)
+float  i_rvolSpike   = input.float(1.8, "Volume Spike Threshold",  minval = 1.0, step = 0.1, group = GRP_VOLUME)
+
+// ── Momentum Engine (used from v0.5) ────────────────────────────────────────────
+string GRP_MOMENTUM = "Momentum Engine"
+int    i_rsiLength   = input.int(14, "RSI Length", minval = 2, group = GRP_MOMENTUM)
+
+// ── Volatility Engine (used from v0.5) ──────────────────────────────────────────
+string GRP_VOLATILITY = "Volatility Engine"
+int    i_atrLength   = input.int(14, "ATR Length", minval = 1, group = GRP_VOLATILITY)
+
+// ── Market Structure ────────────────────────────────────────────────────────────
+string GRP_STRUCTURE = "Market Structure"
+int    i_swingLength    = input.int(5, "Swing Pivot Length", minval = 2, maxval = 50, group = GRP_STRUCTURE,
+     tooltip = "Bars left/right for pivot confirmation. Higher = fewer, stronger swings.")
+bool   i_showStructure  = input.bool(true, "Plot Structure", group = GRP_STRUCTURE,
+     tooltip = "Show swing pivots, BOS/CHOCH markers, and active swing levels.")
+bool   i_showSwingLevels = input.bool(true, "Plot Swing Levels", group = GRP_STRUCTURE)
+
+// ── Liquidity (used from v0.4) ──────────────────────────────────────────────────
+string GRP_LIQUIDITY = "Liquidity Engine"
+float  i_eqTolerance = input.float(0.05, "Equal High/Low Tolerance (%)", minval = 0.01, step = 0.01, group = GRP_LIQUIDITY)
+
+// ── Smart Levels (used from v1.0) ───────────────────────────────────────────────
+string GRP_LEVELS = "Smart Levels"
+int    i_orMinutes   = input.int(15, "Opening Range (Minutes)", minval = 5, maxval = 60, group = GRP_LEVELS)
+
+// ── Alerts ──────────────────────────────────────────────────────────────────────
+string GRP_ALERTS = "Alerts"
+bool   i_alertOnSignal = input.bool(true, "Enable Signal Alerts", group = GRP_ALERTS)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// UTILITY FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Clamp a value between min and max
+f_clamp(float val, float lo, float hi) =>
+    math.max(lo, math.min(hi, val))
+
+// Safe division — returns fallback when denominator is zero or na
+f_safeDiv(float num, float den, float fallback = 0.0) =>
+    na(den) or den == 0.0 ? fallback : num / den
+
+// Normalize a value to 0–100 range given min/max bounds
+f_normalize(float val, float lo, float hi) =>
+    float valueRange = hi - lo
+    valueRange == 0.0 ? 50.0 : f_clamp((val - lo) / valueRange * 100.0, 0.0, 100.0)
+
+// Linear interpolation between two scores based on value position
+f_scoreLinear(float val, float bearish, float bullish) =>
+    f_normalize(val, bearish, bullish)
+
+// Percent change between two prices
+f_pctChange(float fromPrice, float toPrice) =>
+    f_safeDiv(toPrice - fromPrice, fromPrice, 0.0) * 100.0
+
+// Check if current bar is within the analysis window
+f_inAnalysisWindow(int bars) =>
+    bar_index >= bars
+
+// Non-repainting confirmed bar gate — all signal logic must pass through this
+f_isConfirmed() =>
+    barstate.isconfirmed
+
+// Map dashboard position string to table position enum
+f_tablePosition(string pos) =>
+    switch pos
+        "Top Left"     => position.top_left
+        "Bottom Right" => position.bottom_right
+        "Bottom Left"  => position.bottom_left
+        => position.top_right
+
+// Trade quality label from confidence score
+f_tradeQuality(float score) =>
+    score >= 80.0 ? "Excellent" :
+     score >= 65.0 ? "Good" :
+     score >= 50.0 ? "Fair" :
+     score >= 35.0 ? "Weak" : "Poor"
+
+// Dashboard cell color based on bullish/bearish/neutral context
+f_cellBg(bool bullish, bool bearish) =>
+    bullish ? color.new(color.green, 85) :
+     bearish ? color.new(color.red, 85) :
+     color.new(color.gray, 88)
+
+// Recommendation text color
+f_signalColor(string signal) =>
+    signal == "BUY CE" ? color.new(color.lime, 0) :
+     signal == "BUY PE" ? color.new(color.red, 0) :
+     color.new(color.gray, 30)
+
+// EMA slope as percent change over lookback bars (non-repainting — uses confirmed history)
+f_emaSlope(float emaSeries, int lookback) =>
+    float past = emaSeries[lookback]
+    na(past) or past == 0.0 ? 0.0 : f_pctChange(past, emaSeries)
+
+// Regime cell highlight color (string literals — defined before constants block)
+f_regimeColor(string regime) =>
+    regime == "Strong Uptrend"   ? color.new(color.green, 80) :
+     regime == "Strong Downtrend" ? color.new(color.red, 80) :
+     regime == "Range"            ? color.new(color.orange, 82) :
+     color.new(color.yellow, 85)
+
+// Count how many of six boolean bull/bear conditions are true
+f_countTrue(bool c1, bool c2, bool c3, bool c4, bool c5, bool c6) =>
+    (c1 ? 1 : 0) + (c2 ? 1 : 0) + (c3 ? 1 : 0) + (c4 ? 1 : 0) + (c5 ? 1 : 0) + (c6 ? 1 : 0)
+
+// Structure label color for dashboard
+f_structureColor(string label) =>
+    str.contains(label, "Bull") and str.contains(label, "CHOCH") ? color.new(color.aqua, 75) :
+     str.contains(label, "Bear") and str.contains(label, "CHOCH") ? color.new(color.fuchsia, 75) :
+     str.contains(label, "Bull") ? color.new(color.green, 80) :
+     str.contains(label, "Bear") ? color.new(color.red, 80) :
+     color.new(color.gray, 88)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CONSTANTS & ENUMS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Market regime labels
+string REGIME_STRONG_UP   = "Strong Uptrend"
+string REGIME_STRONG_DOWN = "Strong Downtrend"
+string REGIME_RANGE       = "Range"
+string REGIME_TRANSITION  = "Transition"
+
+// Trade recommendation labels
+string SIGNAL_BUY_CE  = "BUY CE"
+string SIGNAL_BUY_PE  = "BUY PE"
+string SIGNAL_NO_TRADE = "NO TRADE"
+
+// Trend direction labels
+string TREND_BULLISH = "Bullish"
+string TREND_BEARISH = "Bearish"
+string TREND_NEUTRAL = "Neutral"
+
+// Market structure labels
+string STRUCT_BULL_BOS    = "Bull BOS"
+string STRUCT_BEAR_BOS    = "Bear BOS"
+string STRUCT_BULL_CHOCH  = "Bull CHOCH"
+string STRUCT_BEAR_CHOCH  = "Bear CHOCH"
+string STRUCT_BULL_HHHL   = "Bullish HH/HL"
+string STRUCT_BEAR_LHLL   = "Bearish LH/LL"
+string STRUCT_BULL        = "Bullish Structure"
+string STRUCT_BEAR        = "Bearish Structure"
+string STRUCT_RANGE       = "Ranging"
+string STRUCT_UNDEFINED   = "Undefined"
+
+// Structure bias constants
+int BIAS_BULL  = 1
+int BIAS_BEAR  = -1
+int BIAS_NEUT  = 0
+
+// Engine score placeholders (0–100) — populated in later versions
+float SCORE_NEUTRAL = 50.0
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VWAP ENGINE  [v0.2]
+// ═══════════════════════════════════════════════════════════════════════════════
+// Components: Session VWAP, price vs VWAP, VWAP slope
+// Runs before Trend Engine — VWAP data feeds regime detection
+
+f_vwapEngine(int slopeLookback) =>
+    // Session-anchored VWAP — resets each trading session on intraday charts
+    float vwapVal   = ta.vwap(hlc3)
+    bool  aboveVwap = close > vwapVal
+
+    // Distance from VWAP as % of price — measures institutional bias
+    float vwapDistPct = f_pctChange(vwapVal, close)
+
+    // VWAP slope — rising VWAP supports bullish context
+    float vwapSlope = f_emaSlope(vwapVal, slopeLookback)
+
+    // Score components (0–100, 50 = neutral)
+    float scorePosition = f_scoreLinear(vwapDistPct, -0.30, 0.30)
+    float scoreSlope    = f_scoreLinear(vwapSlope, -0.05, 0.05)
+    float vwapScore     = f_clamp(scorePosition * 0.65 + scoreSlope * 0.35, 0.0, 100.0)
+
+    [vwapVal, vwapScore, aboveVwap, vwapDistPct, vwapSlope]
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TREND ENGINE  [v0.2]
+// ═══════════════════════════════════════════════════════════════════════════════
+// Components: EMA 21, EMA 55, VWAP alignment, DMI/ADX, EMA slope
+// Regimes   : Strong Uptrend | Strong Downtrend | Range | Transition
+
+f_trendEngine(float vwapVal, bool aboveVwap, float vwapSlope) =>
+    // ── Core indicators (historical only — no repainting) ──────────────────────
+    float emaFastVal = ta.ema(close, i_emaFast)
+    float emaSlowVal = ta.ema(close, i_emaSlow)
+    [plusDI, minusDI, adxVal] = ta.dmi(i_adxLength, i_adxLength)
+
+    float fastSlope  = f_emaSlope(emaFastVal, i_slopeLen)
+    float slowSlope  = f_emaSlope(emaSlowVal, i_slopeLen)
+    float emaSpreadPct = math.abs(f_pctChange(emaSlowVal, emaFastVal))
+    float diSpread   = plusDI - minusDI
+
+    // ── Directional condition checks ─────────────────────────────────────────
+    bool bullEmaAlign  = emaFastVal > emaSlowVal
+    bool bullPriceEma  = close > emaFastVal and close > emaSlowVal
+    bool bullDi        = plusDI > minusDI
+    bool bullSlope     = fastSlope > 0.0 and slowSlope >= 0.0
+    bool bullVwap      = aboveVwap and vwapSlope >= 0.0
+
+    bool bearEmaAlign  = emaFastVal < emaSlowVal
+    bool bearPriceEma  = close < emaFastVal and close < emaSlowVal
+    bool bearDi        = minusDI > plusDI
+    bool bearSlope     = fastSlope < 0.0 and slowSlope <= 0.0
+    bool bearVwap      = not aboveVwap and vwapSlope <= 0.0
+
+    int bullCount = f_countTrue(bullEmaAlign, bullPriceEma, bullDi, bullSlope, bullVwap, adxVal >= i_adxRangeMax)
+    int bearCount = f_countTrue(bearEmaAlign, bearPriceEma, bearDi, bearSlope, bearVwap, adxVal >= i_adxRangeMax)
+
+    // ── Trend label ──────────────────────────────────────────────────────────
+    string trendLabel = bullCount >= 4 ? TREND_BULLISH :
+         bearCount >= 4 ? TREND_BEARISH : TREND_NEUTRAL
+
+    // ── Trend score (0–100: high = bullish, low = bearish, 50 = neutral) ─────
+    float scoreEmaAlign  = bullEmaAlign ? f_scoreLinear(emaSpreadPct, 0.0, i_emaSpreadRange * 3.0) :
+         100.0 - f_scoreLinear(emaSpreadPct, 0.0, i_emaSpreadRange * 3.0)
+    float scorePriceEma  = bullPriceEma ? 75.0 : bearPriceEma ? 25.0 : 50.0
+    float scoreDi        = f_scoreLinear(diSpread, -15.0, 15.0)
+    float scoreSlope     = f_scoreLinear(fastSlope, -0.08, 0.08)
+    float scoreAdxDir    = adxVal >= i_adxRangeMax ? (bullDi ? 65.0 : bearDi ? 35.0 : 50.0) : 50.0
+    float scoreVwapAlign = aboveVwap ? f_scoreLinear(vwapSlope, -0.03, 0.03) * 0.5 + 60.0 :
+         (100.0 - f_scoreLinear(vwapSlope, -0.03, 0.03)) * 0.5 + 10.0
+
+    float trendScore = f_clamp(
+         scoreEmaAlign  * 0.22 +
+         scorePriceEma  * 0.18 +
+         scoreDi        * 0.20 +
+         scoreSlope     * 0.18 +
+         scoreAdxDir    * 0.12 +
+         scoreVwapAlign * 0.10,
+         0.0, 100.0)
+
+    // ── Market regime detection ──────────────────────────────────────────────
+    bool isRange = adxVal < i_adxRangeMax and emaSpreadPct < i_emaSpreadRange
+    bool isStrongUp   = adxVal >= i_adxStrong and bullCount >= 5
+    bool isStrongDown = adxVal >= i_adxStrong and bearCount >= 5
+
+    string regimeLabel = isStrongUp   ? REGIME_STRONG_UP   :
+         isStrongDown ? REGIME_STRONG_DOWN :
+         isRange      ? REGIME_RANGE       :
+         REGIME_TRANSITION
+
+    [trendLabel, trendScore, regimeLabel, emaFastVal, emaSlowVal, adxVal, plusDI, minusDI, fastSlope, emaSpreadPct]
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VOLUME ENGINE  [v0.5]
+// ═══════════════════════════════════════════════════════════════════════════════
+// Components: Relative Volume, Volume Spike Detection
+// Status: STUB — implemented in v0.5
+
+f_volumeEngine() =>
+    // Returns: [rvol, volumeScore, isSpike, volumeLabel]
+    float  rvol        = na
+    float  volumeScore = SCORE_NEUTRAL
+    bool   isSpike     = false
+    string volumeLabel = "Normal"
+    [rvol, volumeScore, isSpike, volumeLabel]
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MOMENTUM ENGINE  [v0.5]
+// ═══════════════════════════════════════════════════════════════════════════════
+// Components: RSI, Price Momentum (ROC)
+// Status: STUB — implemented in v0.5
+
+f_momentumEngine() =>
+    // Returns: [rsiVal, momentumScore, momentumLabel]
+    float  rsiVal         = na
+    float  momentumScore  = SCORE_NEUTRAL
+    string momentumLabel  = "Neutral"
+    [rsiVal, momentumScore, momentumLabel]
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VOLATILITY ENGINE  [v0.5]
+// ═══════════════════════════════════════════════════════════════════════════════
+// Components: ATR, ATR Expansion ratio
+// Status: STUB — implemented in v0.5
+
+f_volatilityEngine() =>
+    // Returns: [atrVal, atrExpansion, volatilityScore, volatilityLabel]
+    float  atrVal          = na
+    float  atrExpansion    = na
+    float  volatilityScore = SCORE_NEUTRAL
+    string volatilityLabel = "Normal"
+    [atrVal, atrExpansion, volatilityScore, volatilityLabel]
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MARKET STRUCTURE ENGINE  [v0.3]
+// ═══════════════════════════════════════════════════════════════════════════════
+// Components: Swing Highs/Lows (confirmed pivots), BOS, CHOCH
+// Non-repaint: ta.pivothigh/low confirm only after `swingLen` right-side bars;
+//              BOS/CHOCH evaluated exclusively on bar close.
+
+f_marketStructureEngine(int swingLen) =>
+    // ── Confirmed pivot detection (repaint-safe) ─────────────────────────────
+    float pivotHigh = ta.pivothigh(high, swingLen, swingLen)
+    float pivotLow  = ta.pivotlow(low, swingLen, swingLen)
+
+    // ── Persistent swing state ───────────────────────────────────────────────
+    var float lastSwingHigh = na
+    var float lastSwingLow  = na
+    var float prevSwingHigh = na
+    var float prevSwingLow  = na
+    var int   structureBias = BIAS_NEUT
+
+    if not na(pivotHigh)
+        prevSwingHigh := lastSwingHigh
+        lastSwingHigh := pivotHigh
+
+    if not na(pivotLow)
+        prevSwingLow := lastSwingLow
+        lastSwingLow := pivotLow
+
+    // ── Swing geometry (HH / HL / LH / LL) ───────────────────────────────────
+    bool higherHigh = not na(prevSwingHigh) and not na(lastSwingHigh) and lastSwingHigh > prevSwingHigh
+    bool lowerHigh  = not na(prevSwingHigh) and not na(lastSwingHigh) and lastSwingHigh < prevSwingHigh
+    bool higherLow  = not na(prevSwingLow) and not na(lastSwingLow) and lastSwingLow > prevSwingLow
+    bool lowerLow   = not na(prevSwingLow) and not na(lastSwingLow) and lastSwingLow < prevSwingLow
+
+    // Update structural bias from swing sequence
+    if higherHigh and higherLow
+        structureBias := BIAS_BULL
+    else if lowerHigh and lowerLow
+        structureBias := BIAS_BEAR
+    else if higherHigh or higherLow
+        structureBias := BIAS_BULL
+    else if lowerHigh or lowerLow
+        structureBias := BIAS_BEAR
+
+    // ── BOS / CHOCH detection (confirmed bar close only) ─────────────────────
+    bool confirmed     = barstate.isconfirmed
+    bool bosDetected   = false
+    bool chochDetected = false
+    bool bullBos       = false
+    bool bearBos       = false
+    bool bullChoch     = false
+    bool bearChoch     = false
+    string structureLabel = STRUCT_UNDEFINED
+
+    if confirmed
+        // Break above last swing high
+        bool breakSwingHigh = not na(lastSwingHigh) and close > lastSwingHigh and close[1] <= lastSwingHigh
+        if breakSwingHigh
+            if structureBias == BIAS_BEAR
+                bullChoch     := true
+                chochDetected := true
+                structureBias := BIAS_BULL
+            else
+                bullBos     := true
+                bosDetected := true
+                if structureBias == BIAS_NEUT
+                    structureBias := BIAS_BULL
+
+        // Break below last swing low
+        bool breakSwingLow = not na(lastSwingLow) and close < lastSwingLow and close[1] >= lastSwingLow
+        if breakSwingLow
+            if structureBias == BIAS_BULL
+                bearChoch     := true
+                chochDetected := true
+                structureBias := BIAS_BEAR
+            else
+                bearBos     := true
+                bosDetected := true
+                if structureBias == BIAS_NEUT
+                    structureBias := BIAS_BEAR
+
+    // ── Structure label (event priority over state) ──────────────────────────
+    if bullChoch
+        structureLabel := STRUCT_BULL_CHOCH
+    else if bearChoch
+        structureLabel := STRUCT_BEAR_CHOCH
+    else if bullBos
+        structureLabel := STRUCT_BULL_BOS
+    else if bearBos
+        structureLabel := STRUCT_BEAR_BOS
+    else if structureBias == BIAS_BULL
+        structureLabel := higherHigh and higherLow ? STRUCT_BULL_HHHL : STRUCT_BULL
+    else if structureBias == BIAS_BEAR
+        structureLabel := lowerHigh and lowerLow ? STRUCT_BEAR_LHLL : STRUCT_BEAR
+    else
+        structureLabel := STRUCT_RANGE
+
+    // ── Structure score (0–100: bullish structure = high) ────────────────────
+    float structureScore = SCORE_NEUTRAL
+    if structureBias == BIAS_BULL
+        structureScore := bullBos ? 82.0 :
+             bullChoch ? 62.0 :
+             higherHigh and higherLow ? 76.0 :
+             higherHigh or higherLow ? 68.0 : 60.0
+    else if structureBias == BIAS_BEAR
+        structureScore := bearBos ? 18.0 :
+             bearChoch ? 38.0 :
+             lowerHigh and lowerLow ? 24.0 :
+             lowerHigh or lowerLow ? 32.0 : 40.0
+
+    [structureScore, structureLabel, lastSwingHigh, lastSwingLow, bosDetected, chochDetected,
+         bullBos, bearBos, bullChoch, bearChoch, structureBias, pivotHigh, pivotLow]
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SUPPORT & RESISTANCE ENGINE  [v1.0]
+// ═══════════════════════════════════════════════════════════════════════════════
+// Components: PDH, PDL, PDC, ORH, ORL
+// Status: STUB — implemented in v1.0
+
+f_supportResistanceEngine() =>
+    // Returns: [pdh, pdl, pdc, orh, orl, srScore]
+    float pdh    = na
+    float pdl    = na
+    float pdc    = na
+    float orh    = na
+    float orl    = na
+    float srScore = SCORE_NEUTRAL
+    [pdh, pdl, pdc, orh, orl, srScore]
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LIQUIDITY ENGINE  [v0.4]
+// ═══════════════════════════════════════════════════════════════════════════════
+// Components: Equal Highs/Lows, Liquidity Sweeps, False Breakouts
+// Status: STUB — implemented in v0.4
+
+f_liquidityEngine() =>
+    // Returns: [liquidityScore, liquidityLabel, sweepDetected, falseBreakout]
+    float  liquidityScore  = SCORE_NEUTRAL
+    string liquidityLabel  = "None"
+    bool   sweepDetected   = false
+    bool   falseBreakout   = false
+    [liquidityScore, liquidityLabel, sweepDetected, falseBreakout]
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// AI CONFIDENCE ENGINE  [v0.5]
+// ═══════════════════════════════════════════════════════════════════════════════
+// Weighted composite score from all engines (0–100)
+// Status: STUB — implemented in v0.5
+
+f_aiConfidenceEngine(
+     float trendScore,
+     float momentumScore,
+     float volumeScore,
+     float volatilityScore,
+     float structureScore,
+     float vwapScore,
+     float liquidityScore) =>
+    // Default equal weights — refined in v0.5
+    float wTrend      = 0.20
+    float wMomentum   = 0.15
+    float wVolume     = 0.10
+    float wVolatility = 0.10
+    float wStructure  = 0.20
+    float wVwap       = 0.15
+    float wLiquidity  = 0.10
+
+    float confidence =
+         trendScore      * wTrend +
+         momentumScore   * wMomentum +
+         volumeScore     * wVolume +
+         volatilityScore * wVolatility +
+         structureScore  * wStructure +
+         vwapScore       * wVwap +
+         liquidityScore  * wLiquidity
+
+    f_clamp(confidence, 0.0, 100.0)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ENTRY ENGINE  [v1.0]
+// ═══════════════════════════════════════════════════════════════════════════════
+// Generates BUY CE / BUY PE / NO TRADE based on confidence + engine alignment
+// Status: STUB — returns NO TRADE until v1.0
+
+f_entryEngine(
+     float  confidence,
+     string trendLabel,
+     string regimeLabel,
+     float  threshold) =>
+    string signal   = SIGNAL_NO_TRADE
+    float  entry    = na
+    float  stopLoss = na
+    float  target1  = na
+    float  target2  = na
+    float  riskReward = na
+
+    bool inWindow = f_inAnalysisWindow(i_analysisBars)
+    bool confirmed = f_isConfirmed()
+
+    // v0.3: Structure engine live; trade signals still pending until v1.0
+    if inWindow and confirmed and confidence >= threshold
+        signal := SIGNAL_NO_TRADE
+
+    [signal, entry, stopLoss, target1, target2, riskReward]
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// EXIT ENGINE  [v1.0]
+// ═══════════════════════════════════════════════════════════════════════════════
+// Manages stop loss, target hits, and time-based exits
+// Status: STUB — implemented in v1.0
+
+f_exitEngine(string activeSignal, float sl, float tp1, float tp2) =>
+    bool exitSl  = false
+    bool exitTp1 = false
+    bool exitTp2 = false
+    // Placeholder — wired in v1.0
+    [exitSl, exitTp1, exitTp2]
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MAIN EXECUTION PIPELINE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── Run all engines (VWAP before Trend — dependency order) ───────────────────
+[vwapVal, vwapScore, aboveVwap, vwapDistPct, vwapSlope] = f_vwapEngine(i_slopeLen)
+[trendLabel, trendScore, regimeLabel, emaFast, emaSlow, adxVal, plusDI, minusDI, emaFastSlope, emaSpreadPct] =
+     f_trendEngine(vwapVal, aboveVwap, vwapSlope)
+[rvol, volumeScore, isSpike, volumeLabel] = f_volumeEngine()
+[rsiVal, momentumScore, momentumLabel] = f_momentumEngine()
+[atrVal, atrExpansion, volatilityScore, volatilityLabel] = f_volatilityEngine()
+[structureScore, structureLabel, lastSwingHigh, lastSwingLow, bosDetected, chochDetected,
+     bullBos, bearBos, bullChoch, bearChoch, structureBias, pivotHigh, pivotLow] =
+     f_marketStructureEngine(i_swingLength)
+[pdh, pdl, pdc, orh, orl, srScore] = f_supportResistanceEngine()
+[liquidityScore, liquidityLabel, sweepDetected, falseBreakout] = f_liquidityEngine()
+
+// ── AI Confidence ─────────────────────────────────────────────────────────────
+float confidence = f_aiConfidenceEngine(
+     trendScore, momentumScore, volumeScore, volatilityScore,
+     structureScore, vwapScore, liquidityScore)
+
+// ── Entry / Exit ────────────────────────────────────────────────────────────────
+[signal, entryPrice, stopLoss, target1, target2, riskReward] =
+     f_entryEngine(confidence, trendLabel, regimeLabel, i_confidenceThreshold)
+
+[exitSl, exitTp1, exitTp2] = f_exitEngine(signal, stopLoss, target1, target2)
+
+// ── Derived display values ──────────────────────────────────────────────────────
+string tradeQuality = f_tradeQuality(confidence)
+bool   isConfirmed  = f_isConfirmed()
+
+// Regime change tracking (confirmed bars only — non-repainting)
+var string prevRegime = REGIME_TRANSITION
+bool regimeChanged = isConfirmed and regimeLabel != prevRegime and f_inAnalysisWindow(i_analysisBars)
+if isConfirmed
+    prevRegime := regimeLabel
+
+// Structure event flags for alerts (confirmed bars only)
+bool structureEvent = isConfirmed and (bosDetected or chochDetected) and f_inAnalysisWindow(i_analysisBars)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// STRATEGY ORDERS  [v1.0]
+// ═══════════════════════════════════════════════════════════════════════════════
+// v0.1: No orders placed — framework validation only
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DASHBOARD
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var table dashboard = na
+
+if i_showDashboard and barstate.islast
+    if not na(dashboard)
+        table.delete(dashboard)
+
+    dashboard := table.new(
+         f_tablePosition(i_dashboardPos),
+         columns = 2,
+         rows    = 15,
+         bgcolor = color.new(#1a1a2e, 5),
+         border_width = 1,
+         border_color = color.new(color.white, 80))
+
+    color headerBg  = color.new(#16213e, 0)
+    color headerFg  = color.new(#e94560, 0)
+    color labelFg   = color.new(color.white, 20)
+    color valueFg   = color.new(color.white, 0)
+
+    // Header row
+    table.cell(dashboard, 0, 0, "AI Smart Market Engine PRO", text_color = headerFg, bgcolor = headerBg, text_size = size.small)
+    table.merge_cells(dashboard, 0, 0, 1, 0)
+
+    // Row 1 — Version
+    table.cell(dashboard, 0, 1, "Version",     text_color = labelFg, text_size = size.small)
+    table.cell(dashboard, 1, 1, "v0.3 Structure", text_color = valueFg, text_size = size.small)
+
+    // Row 2 — Trend
+    table.cell(dashboard, 0, 2, "Trend",       text_color = labelFg, text_size = size.small)
+    table.cell(dashboard, 1, 2, trendLabel + " (" + str.tostring(trendScore, "#.0") + ")", text_color = valueFg, bgcolor = f_cellBg(trendLabel == TREND_BULLISH, trendLabel == TREND_BEARISH), text_size = size.small)
+
+    // Row 3 — Market Regime
+    table.cell(dashboard, 0, 3, "Regime",      text_color = labelFg, text_size = size.small)
+    table.cell(dashboard, 1, 3, regimeLabel,   text_color = valueFg, bgcolor = f_regimeColor(regimeLabel), text_size = size.small)
+
+    // Row 4 — ADX / DMI
+    table.cell(dashboard, 0, 4, "ADX / DMI",   text_color = labelFg, text_size = size.small)
+    table.cell(dashboard, 1, 4, str.tostring(adxVal, "#.1") + " | +" + str.tostring(plusDI, "#.0") + " / -" + str.tostring(minusDI, "#.0"), text_color = valueFg, text_size = size.small)
+
+    // Row 5 — VWAP
+    string vwapSide = aboveVwap ? "Above" : "Below"
+    table.cell(dashboard, 0, 5, "VWAP",        text_color = labelFg, text_size = size.small)
+    table.cell(dashboard, 1, 5, vwapSide + " (" + str.tostring(vwapScore, "#.0") + ")", text_color = aboveVwap ? color.new(color.lime, 10) : color.new(color.red, 10), text_size = size.small)
+
+    // Row 6 — EMA Slope
+    table.cell(dashboard, 0, 6, "EMA Slope",   text_color = labelFg, text_size = size.small)
+    table.cell(dashboard, 1, 6, str.tostring(emaFastSlope, "#.3") + "%", text_color = emaFastSlope > 0 ? color.new(color.lime, 10) : emaFastSlope < 0 ? color.new(color.red, 10) : valueFg, text_size = size.small)
+
+    // Row 7 — Market Structure
+    table.cell(dashboard, 0, 7, "Structure",   text_color = labelFg, text_size = size.small)
+    table.cell(dashboard, 1, 7, structureLabel + " (" + str.tostring(structureScore, "#.0") + ")", text_color = valueFg, bgcolor = f_structureColor(structureLabel), text_size = size.small)
+
+    // Row 8 — Swing Levels
+    string swingTxt = (na(lastSwingHigh) ? "SH:—" : "SH:" + str.tostring(lastSwingHigh, format.mintick)) +
+         " | " + (na(lastSwingLow) ? "SL:—" : "SL:" + str.tostring(lastSwingLow, format.mintick))
+    table.cell(dashboard, 0, 8, "Swing Levels", text_color = labelFg, text_size = size.small)
+    table.cell(dashboard, 1, 8, swingTxt, text_color = valueFg, text_size = size.tiny)
+
+    // Row 9 — Confidence
+    table.cell(dashboard, 0, 9, "Confidence",  text_color = labelFg, text_size = size.small)
+    table.cell(dashboard, 1, 9, str.tostring(confidence, "#.0") + " / 100", text_color = valueFg, text_size = size.small)
+
+    // Row 10 — Volume
+    table.cell(dashboard, 0, 10, "Volume",      text_color = labelFg, text_size = size.small)
+    table.cell(dashboard, 1, 10, volumeLabel,   text_color = valueFg, text_size = size.small)
+
+    // Row 11 — Momentum
+    table.cell(dashboard, 0, 11, "Momentum",    text_color = labelFg, text_size = size.small)
+    table.cell(dashboard, 1, 11, momentumLabel, text_color = valueFg, text_size = size.small)
+
+    // Row 12 — ATR
+    table.cell(dashboard, 0, 12, "ATR",         text_color = labelFg, text_size = size.small)
+    table.cell(dashboard, 1, 12, na(atrVal) ? "—" : str.tostring(atrVal, format.mintick), text_color = valueFg, text_size = size.small)
+
+    // Row 13 — Trade Quality
+    table.cell(dashboard, 0, 13, "Trade Quality", text_color = labelFg, text_size = size.small)
+    table.cell(dashboard, 1, 13, tradeQuality,  text_color = valueFg, text_size = size.small)
+
+    // Row 14 — Recommendation
+    table.cell(dashboard, 0, 14, "Signal",      text_color = labelFg, text_size = size.small)
+    table.cell(dashboard, 1, 14, signal,        text_color = f_signalColor(signal), bgcolor = color.new(#0f3460, 20), text_size = size.normal)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CHART PLOTS  [v0.2]
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// EMA lines + trend cloud
+emaFastPlot = plot(i_showEmas ? emaFast : na, title = "EMA 21", color = color.new(#00bcd4, 0), linewidth = 2)
+emaSlowPlot = plot(i_showEmas ? emaSlow : na, title = "EMA 55", color = color.new(#ff9800, 0), linewidth = 2)
+plot(i_showVwap ? vwapVal : na, title = "Session VWAP", color = color.new(#9c27b0, 0), linewidth = 2, style = plot.style_circles)
+fill(emaFastPlot, emaSlowPlot,
+     color = emaFast > emaSlow ? color.new(color.green, 90) : color.new(color.red, 90),
+     title = "EMA Trend Cloud")
+
+// Regime background tint (confirmed bars only — non-repainting)
+color regimeBg = regimeLabel == REGIME_STRONG_UP   ? color.new(color.green, 95) :
+     regimeLabel == REGIME_STRONG_DOWN ? color.new(color.red, 95) :
+     regimeLabel == REGIME_RANGE       ? color.new(color.orange, 96) :
+     color.new(color.yellow, 97)
+bgcolor(f_inAnalysisWindow(i_analysisBars) ? regimeBg : na, title = "Regime Background")
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MARKET STRUCTURE PLOTS  [v0.3]
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Active swing levels (step lines — update only on confirmed pivots)
+plot(i_showStructure and i_showSwingLevels ? lastSwingHigh : na, title = "Swing High",
+     color = color.new(color.red, 40), linewidth = 1, style = plot.style_stepline)
+plot(i_showStructure and i_showSwingLevels ? lastSwingLow : na, title = "Swing Low",
+     color = color.new(color.green, 40), linewidth = 1, style = plot.style_stepline)
+
+// Confirmed swing pivot markers (offset places marker on actual pivot bar)
+plotshape(i_showStructure and not na(pivotHigh), title = "Swing High Pivot",
+     style = shape.triangledown, location = location.abovebar,
+     color = color.new(color.red, 0), size = size.tiny, offset = -i_swingLength)
+plotshape(i_showStructure and not na(pivotLow), title = "Swing Low Pivot",
+     style = shape.triangleup, location = location.belowbar,
+     color = color.new(color.green, 0), size = size.tiny, offset = -i_swingLength)
+
+// BOS markers — continuation breaks
+plotshape(i_showStructure and bullBos, title = "Bullish BOS",
+     style = shape.labelup, location = location.belowbar,
+     color = color.new(color.lime, 10), textcolor = color.white, text = "BOS", size = size.tiny)
+plotshape(i_showStructure and bearBos, title = "Bearish BOS",
+     style = shape.labeldown, location = location.abovebar,
+     color = color.new(color.red, 10), textcolor = color.white, text = "BOS", size = size.tiny)
+
+// CHOCH markers — character change / reversal
+plotshape(i_showStructure and bullChoch, title = "Bullish CHOCH",
+     style = shape.labelup, location = location.belowbar,
+     color = color.new(color.aqua, 10), textcolor = color.black, text = "CHoCH", size = size.small)
+plotshape(i_showStructure and bearChoch, title = "Bearish CHOCH",
+     style = shape.labeldown, location = location.abovebar,
+     color = color.new(color.fuchsia, 10), textcolor = color.white, text = "CHoCH", size = size.small)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ALERTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+alertcondition(
+     i_alertOnSignal and structureEvent and bullBos,
+     title   = "Bullish BOS",
+     message = "AI SME PRO | {{ticker}} | {{interval}} | Bullish Break of Structure detected.")
+
+alertcondition(
+     i_alertOnSignal and structureEvent and bearBos,
+     title   = "Bearish BOS",
+     message = "AI SME PRO | {{ticker}} | {{interval}} | Bearish Break of Structure detected.")
+
+alertcondition(
+     i_alertOnSignal and structureEvent and bullChoch,
+     title   = "Bullish CHOCH",
+     message = "AI SME PRO | {{ticker}} | {{interval}} | Bullish Change of Character — potential reversal up.")
+
+alertcondition(
+     i_alertOnSignal and structureEvent and bearChoch,
+     title   = "Bearish CHOCH",
+     message = "AI SME PRO | {{ticker}} | {{interval}} | Bearish Change of Character — potential reversal down.")
+
+alertcondition(
+     i_alertOnSignal and regimeChanged,
+     title   = "Regime Change",
+     message = "AI SME PRO | {{ticker}} | {{interval}} | Market regime changed — check dashboard.")
+
+// Alert conditions — const messages required; use alert() below for dynamic payloads
+alertcondition(
+     i_alertOnSignal and isConfirmed and signal == SIGNAL_BUY_CE,
+     title   = "BUY CE Signal",
+     message = "AI SME PRO | {{ticker}} | {{interval}} | BUY CE — Check dashboard for confidence score.")
+
+alertcondition(
+     i_alertOnSignal and isConfirmed and signal == SIGNAL_BUY_PE,
+     title   = "BUY PE Signal",
+     message = "AI SME PRO | {{ticker}} | {{interval}} | BUY PE — Check dashboard for confidence score.")
+
+alertcondition(
+     i_alertOnSignal and isConfirmed and signal == SIGNAL_NO_TRADE,
+     title   = "No Trade",
+     message = "AI SME PRO | {{ticker}} | {{interval}} | NO TRADE — Conditions not met.")
+
+// Dynamic alert() for strategy automation — active from v1.0
+if i_alertOnSignal and isConfirmed and (signal == SIGNAL_BUY_CE or signal == SIGNAL_BUY_PE)
+    alert("AI SME PRO | " + syminfo.ticker + " | " + signal + " | Conf: " + str.tostring(confidence, "#.0"), alert.freq_once_per_bar_close)
